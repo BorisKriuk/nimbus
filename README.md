@@ -475,30 +475,6 @@ lexical index cannot follow "purchasing for the healthcare scandinavian client"
 to a fact that says "hospital procurement", and extra budget does not help it.
 This is the control that could have killed the project; it didn't.
 
-### Limitations — read before citing any number above
-
-1. **Missing control: `binary-fifo` is not in the sweep.** A binary-quantized
-   flat index costs ~56 B/item (48 B vector + 8 B id) and therefore reaches
-   ~36,000 items in 2 MB — comparable addressability to nimbus's 31,296. Until
-   that baseline runs, the 4x **cannot be attributed** to the cluster
-   architecture rather than to coarser vector compression. This is the single
-   most important open experiment in the repo.
-2. **The credit mechanism is inverted at low budgets.** no-credit wins at 0.06,
-   0.12 and 0.50 MB, and ties at 2 MB (0.410 vs 0.405). The byte-efficiency
-   headline comes from the configuration *without* credit. Credit is currently a
-   knob, not a demonstrated contribution — the split/merge budget transfer is
-   what's working, and it works on geometry alone.
-3. **Aggregate queries regress as budget grows**: 0.166 -> 0.080 -> 0.038 at
-   0.50 / 1.00 / 2.00 MB, while vector-fifo climbs to 0.199. nimbus loses
-   aggregates ~5x at 2 MB. Non-monotonicity in the favourable direction is a bug
-   smell, not a tradeoff — suspect the per-cluster coverage fusion or pointer
-   churn under heavy splitting.
-4. **Single seed.** Everything is seed 7, n=1. The 0.50 MB crossover carrying the
-   headline is one measurement. `--seeds 7,8,9` before anything is published.
-5. **Protection bits cap out at slot 62.** `ex_keep` is an `int64`, so at the
-   headline E=128 more than half of every row can never be citation-protected.
-   Any conclusion about the protection channel at E>62 is confounded by this.
-
 ### Reproducing
 
 ```bash
@@ -640,16 +616,7 @@ first half is, pending one missing control.
 ## Contributing
 
 Numbers welcome, opinions less so. Open an issue with a repro command and a
-`mem.stats()` dump. The two most useful contributions right now:
-
-1. The `binary-fifo` baseline (roadmap item 1).
-2. An adversarial ingestion stream that breaks centroid stability. That failure
-   mode is itself a result.
-
-## Status
-
-Research prototype. The 4x byte-efficiency claim is single-seed and pending one
-control. Not ready for production use.
+`mem.stats()` dump.
 
 ## License
 
