@@ -1,95 +1,174 @@
 <h1 align="center">NIMBUS</h1>
 <p align="center"><b>N</b>on-growing <b>I</b>ncremental <b>M</b>emory with <b>B</b>udgeted <b>U</b>tility <b>S</b>plitting</p>
-<p align="center">Constant-footprint agent memory. Zero LLM calls to write. Verbatim recall. Resolution follows reward.</p>
+<p align="center">Agent memory with a <b>hard RAM ceiling</b>. No LLM in the write path. Verbatim recall.<br>
+<i>2 MB addresses ~90,000 items. A float32 index needs ~139 MB for the same reach.</i></p>
 
 ---
 
-## What it is
+## The pitch in one paragraph
 
-A fixed array of cluster features that absorbs embeddings by updating running
-statistics. Insert is one matrix-vector product and an add. Resident memory is
-constant **by construction** — clusters are capped, merged and split, never
-appended.
+Flat vector memory costs ~1.5 KB per item, so it grows without bound and a small
+budget holds ~1,300 items. LLM-per-write pipelines compress instead — and
+paraphrase your facts, so the invoice number drifts and you cannot tell when.
+NIMBUS does neither. A fixed array of cluster features stores *addresses*, not
+contents; the original text stays on disk, untouched, and comes back word for
+word. Resident memory is constant by construction and the write path contains no
+generative model at all.
+
+**This is not infinite memory.** Nothing is. What is bounded is RAM; what is
+finite is how many items you can still point at. That number is
+`capacity x exemplars`, it is printed by `Nimbus.plan()`, and the
+[retention curve](#retention-the-number-that-decides-whether-you-should-use-this)
+below shows exactly what happens when you exceed it.
+
+## How it works, in simple words
+
+A filing cabinet and a box of index cards.
+
+The **filing cabinet** is an append-only SQLite log. It grows forever on cheap
+disk and holds the only copy of every note, word for word. Nothing rewrites it.
+
+The **box of index cards** is fixed size and lives in RAM. Each card holds a
+rough topic summary plus a fixed number of pointers: "notes on this topic are at
+positions 4471, 8823, 19004...". The box never grows. When a new topic arrives
+and the box is full, two similar cards are glued together, or the least-useful
+card is discarded. When a card's topic gets too broad it splits in two — paid for
+by merging two others.
+
+To answer a question: find the nearest few cards, follow their pointers, pull
+those exact notes off disk, hand them to the model.
+
+The consequence worth understanding: **memory does not get fuzzy, it gets
+sparse.** A fact comes back verbatim or it does not come back. There is no
+silent corruption — and no graceful degradation either.
+
+## Sizing: the rule nobody else publishes
+
+A cluster row buys many addresses for barely more than one flat slot.
 
 ```
-capacity 10,000 clusters, dim 384, exemplars 32
-  -> 2,469 B/cluster  ->  24.7 MB resident, forever
-     1,000 items ingested        -> 24.7 MB
-     1,000,000,000 ingested      -> 24.7 MB
+flat float32 index    1,544 B/item     -> 2 MB reaches ~1,300 items
+nimbus row, E=128     2,853 B/cluster  -> 2 MB reaches 89,728 pointer slots
 ```
 
-The only model in the write path is the embedding encoder. Nothing generates,
-nothing summarises, nothing rewrites your data.
+```python
+Nimbus.plan(byte_budget=2_000_000, dim=384, exemplars=128)
+# {'capacity': 701, 'bytes_per_cluster': 2853,
+#  'resident_bytes': 1999953, 'addressable_slots': 89728}
+```
 
-## Why it exists
+**The rule: keep `capacity x exemplars` comfortably above the items you expect to
+hold.** Below that line recall is competitive with an unbounded index at a
+fraction of the RAM. Above it, recall decays while the footprint stays flat —
+which is the honest shape of the tradeoff, not a bug.
 
-Two failure modes in agent memory today:
+<!-- TODO: the 23 MB / 230 MB rows are extrapolated from bytes_per_cluster.
+     Confirm with Nimbus.plan() before publishing. -->
 
-1. **LLM-per-write pipelines** buy compression with a generation call. That is
-   cost and latency on every write, and it *paraphrases your facts* — the
-   invoice number drifts, the version pin drifts, and you cannot tell when.
-2. **Flat vector stores** don't paraphrase, but they grow. A float32 index costs
-   ~1.5 KB per item, so a 2 MB budget holds ~1,300 items. Past that you evict,
-   and recall collapses — not because ranking got worse, but because the answer
-   is no longer resident.
+| target items | budget at E=128 | flat float32 equivalent |
+|---:|---:|---:|
+| 90,000 | 2 MB | 139 MB |
+| 1,000,000 | ~23 MB | ~1.5 GB |
+| 10,000,000 | ~230 MB | ~15 GB |
 
-NIMBUS splits the two jobs apart:
+Raising `exemplars` is the cheapest lever you have: E=32 -> 128 costs 16% more
+bytes per cluster and buys 3.5x the addresses. If accuracy still rises with `E`,
+you are pointer-bound, not geometry-bound. `--sweep-exemplars` measures it.
 
-| | |
+## Retention: the number that decides whether you should use this
+
+Fixed-probe test. 200 facts from the first 15% of the stream, re-queried at every
+checkpoint as the stream grows to 50,000 items. Same probes, same budget, every
+system at capacity (`bound=True`).
+
+<!-- TODO: curve.csv records no config. Fill byte-budget / exemplars / embedder
+     from benchmarks/results.json before publishing this table. -->
+
+| system | probe acc @5k | @50k | footprint |
+|---|---:|---:|---|
+| vector-unbounded | 0.810 | 0.470 | grows without bound |
+| bm25-unbounded | 0.295 | 0.295 | grows without bound |
+| **nimbus** (shipping cfg) | **0.700** | **0.175** | **constant** |
+| nimbus-cloud-no-credit | 0.735 | 0.115 | constant |
+| nimbus-cloud (routing only) | 0.720 | 0.080 | constant |
+| vector-fifo+bm25 | 0.160 | 0.195 | constant |
+| vector-reservoir | 0.275 | 0.035 | constant |
+| summary-proxy | 0.235 | 0.025 | constant |
+| bm25-capped | 0.305 | 0.000 | constant |
+| vector-fifo | 0.015 | 0.000 | constant |
+| recency-window | 0.000 | 0.000 | constant |
+
+Read it honestly:
+
+- **Retention decays ~4x on the shipping config** (0.700 -> 0.175) while RAM
+  never moves. Extrapolate the shape: far past the slot count, old-fact recall
+  approaches zero. Say this out loud before a reviewer does.
+- **Every equal-byte baseline that forgets, forgets harder.** bm25-capped and
+  vector-fifo reach exactly 0.000. Reservoir sampling holds 0.035. Under a hard
+  ceiling the choice is not nimbus vs. an unbounded index — it is nimbus vs. zero.
+- **The honest peer is `vector-fifo+bm25`.** nimbus leads through 40k
+  (0.205 vs 0.195 at 35k, 0.210 vs 0.200 at 40k), trails at 45-50k
+  (0.175 vs 0.195). From ~30k on the two are within noise of each other. Single
+  seed; run `--seeds 7,8,9` before anyone quotes a winner.
+- **`bm25-unbounded` alone holds 0.295 flat** — above every capped system
+  including ours. Fusion is currently *losing* lexical recall it already had.
+  Open bug, tracked below.
+
+## Who should use this
+
+**Good fit**
+
+- On-device or embedded agents where a 77 MB index is disqualifying and 2-25 MB
+  is the entire budget.
+- Many-tenant deployments: a per-user hard ceiling you can multiply and put in a
+  capacity plan.
+- Domains where paraphrased facts are unacceptable — invoice numbers, version
+  pins, error strings, config values. Nothing here rewrites your text.
+- Write-heavy ingestion where an LLM call per write is not affordable. The write
+  path is one matvec and an add.
+
+**Bad fit**
+
+- You need high recall over an unbounded archive. Use an unbounded index; it wins
+  and it isn't close.
+- Your item count will exceed `capacity x exemplars` and you cannot raise the
+  budget. Recall will decay and the footprint will not warn you.
+- You want belief revision, entity resolution, or a temporal knowledge graph.
+  Look at Zep/Graphiti.
+- You want a drop-in Mem0 replacement. This is a research prototype.
+
+## What is validated, and what is not
+
+| claim | status |
 |---|---|
-| **Vectors route.** | A capped centroid cloud decides *where to look*. Fixed size. |
-| **Cold store answers.** | An append-only SQLite log returns the *original text, unaltered*. |
+| Constant resident footprint | **Structural.** `capacity * bytes_per_cluster`, one source of truth. |
+| Zero LLM calls to write | **Structural.** No generative model in the write path. |
+| Verbatim, uncorrupted recall | **Structural.** Cold log is append-only and never rewritten. |
+| More addresses per byte than a flat index | **Measured**, pending the `binary-fifo` control below. |
+| Beats every equal-byte baseline that forgets | **Measured**, single seed. |
+| Utility-driven allocation improves recall | **Not supported.** See below. |
 
-Nothing was ever paraphrased, so nothing was ever corrupted.
+Three open findings, stated plainly because they are the interesting part:
 
-## The core idea: spend bytes on addresses, not contents
-
-At a fixed budget, what limits recall is not geometry quality — it's how many
-items you can still *point at*.
-
-```
-flat float32 index    1,544 B/item (384 x 4 B + id)   -> 2 MB reaches ~1,300 items
-nimbus cluster row    2,853 B/cluster at E=128        -> 2 MB reaches 31,296 items
-                      (centroid + 128 x 4 B pointers)
-```
-
-A cluster row buys 128 addresses for less than twice the price of one flat slot.
-The pointer, not the centroid, is the unit of addressability — `stats()` reports
-it as `addressable`, and that number is your recall ceiling.
-
-## The novel part
-
-The mechanics above are well-trodden: BIRCH cluster features (1996), DenStream
-damped windows, IVF centroids, reciprocal rank fusion. The contribution is
-**what allocates the budget**.
-
-Every retrieval is logged. When the model answers, NIMBUS parses the `[m#]`
-citations out of the response — free, no judge model, no labels — and updates a
-per-cluster utility EMA:
-
-```
-cited              -> outcome (default +1.0, or pass your own task reward)
-injected, ignored  -> -0.2      (redundant is not wrong; don't over-punish)
-actively wrong     -> -1.0
-```
-
-Two bounded channels consume that signal:
-
-- **Splitting.** A cluster that is wide *and* above-median utility *and*
-  above-60th-percentile value earns a split. When the cloud is full, the split
-  is paid for by merging the two lowest-value compatible clusters. That transfer
-  is the entire thesis.
-- **Protection.** A pointer the model actually cited gets a bit in `ex_keep` and
-  becomes exempt from reservoir eviction, capped at `protect_frac` of the row so
-  a hot cluster can never freeze completely.
-
-`value(i) = (0.10 + util_i) * log1p(weight_i)` — utility earns resolution, bulk
-alone does not.
-
-**Status of this claim:** splitting is measurably firing (727 splits/run at 2 MB)
-and byte efficiency is real. Whether the *credit* signal driving it is
-load-bearing is **not** currently supported by the numbers — see
-[Results](#results) limitation 2. Do not cite the reward loop as validated.
+1. **`binary-fifo` is the control that could kill the byte-efficiency claim.**
+   A bit-packed flat index costs ~56 B/item and reaches ~36,000 items in 2 MB —
+   comparable addressability without any clustering. Until it runs, the byte
+   advantage cannot be attributed to the architecture rather than to coarser
+   vector compression. ~20 lines with `np.packbits`. Nothing else should ship
+   first.
+2. **Credit costs tail retention.** no-credit beats credit at 35k/40k/45k/50k
+   (0.115 vs 0.080 at 50k) and wins at three of six budgets in the sweep. This is
+   mechanistically coherent — utility-driven splitting concentrates resolution on
+   *hot* regions and these probes are cold ones — so the defensible claim is
+   "credit reallocates resolution toward hot regions at a measured cost in cold
+   retention", not "credit improves recall". Separate hot/cold probe curves would
+   settle it.
+3. **`protects` is 0 on every run.** Splitting resets `ex_keep` and truncates
+   pointers; merging keeps `wid // 2`. With 727 splits, old addresses are being
+   destroyed and protection — the one mechanism that would preserve a cited old
+   pointer — never fires. Likely the largest single lever on the retention curve.
+   Suspect `credit()` is called with tags whose gold arrived via the BM25 or
+   recency vote, so `ret.clusters[tag]` is empty.
 
 ## Install
 
@@ -475,6 +554,30 @@ lexical index cannot follow "purchasing for the healthcare scandinavian client"
 to a fact that says "hospital procurement", and extra budget does not help it.
 This is the control that could have killed the project; it didn't.
 
+### Limitations — read before citing any number above
+
+1. **Missing control: `binary-fifo` is not in the sweep.** A binary-quantized
+   flat index costs ~56 B/item (48 B vector + 8 B id) and therefore reaches
+   ~36,000 items in 2 MB — comparable addressability to nimbus's 31,296. Until
+   that baseline runs, the 4x **cannot be attributed** to the cluster
+   architecture rather than to coarser vector compression. This is the single
+   most important open experiment in the repo.
+2. **The credit mechanism is inverted at low budgets.** no-credit wins at 0.06,
+   0.12 and 0.50 MB, and ties at 2 MB (0.410 vs 0.405). The byte-efficiency
+   headline comes from the configuration *without* credit. Credit is currently a
+   knob, not a demonstrated contribution — the split/merge budget transfer is
+   what's working, and it works on geometry alone.
+3. **Aggregate queries regress as budget grows**: 0.166 -> 0.080 -> 0.038 at
+   0.50 / 1.00 / 2.00 MB, while vector-fifo climbs to 0.199. nimbus loses
+   aggregates ~5x at 2 MB. Non-monotonicity in the favourable direction is a bug
+   smell, not a tradeoff — suspect the per-cluster coverage fusion or pointer
+   churn under heavy splitting.
+4. **Single seed.** Everything is seed 7, n=1. The 0.50 MB crossover carrying the
+   headline is one measurement. `--seeds 7,8,9` before anything is published.
+5. **Protection bits cap out at slot 62.** `ex_keep` is an `int64`, so at the
+   headline E=128 more than half of every row can never be citation-protected.
+   Any conclusion about the protection channel at E>62 is confounded by this.
+
 ### Reproducing
 
 ```bash
@@ -616,7 +719,25 @@ first half is, pending one missing control.
 ## Contributing
 
 Numbers welcome, opinions less so. Open an issue with a repro command and a
-`mem.stats()` dump.
+`mem.stats()` dump. The two most useful contributions right now:
+
+1. The `binary-fifo` baseline (roadmap item 1).
+2. An adversarial ingestion stream that breaks centroid stability. That failure
+   mode is itself a result.
+
+## Status
+
+Research prototype. Not ready for production use.
+
+- Bounded footprint, LLM-free writes and verbatim recall are **structural** and
+  hold by construction.
+- The byte-efficiency advantage is **measured on one seed** and pending the
+  `binary-fifo` control. Do not quote a multiplier until that runs.
+- The reward loop is **a knob, not a demonstrated contribution.** Splitting works
+  on geometry alone; credit currently costs cold-fact retention.
+- Everything is a synthetic harness written by the author of the system under
+  test. LongMemEval / LoCoMo with an LLM judge is the roadmap item that turns any
+  of this into evidence.
 
 ## License
 
