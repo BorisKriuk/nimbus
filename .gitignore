@@ -1,0 +1,27 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# nimbus runtime state (regenerate from the cold log)
+data/
+*.npz
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# os / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.ipynb_checkpoints/
