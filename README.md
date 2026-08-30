@@ -719,25 +719,7 @@ first half is, pending one missing control.
 ## Contributing
 
 Numbers welcome, opinions less so. Open an issue with a repro command and a
-`mem.stats()` dump. The two most useful contributions right now:
-
-1. The `binary-fifo` baseline (roadmap item 1).
-2. An adversarial ingestion stream that breaks centroid stability. That failure
-   mode is itself a result.
-
-## Status
-
-Research prototype. Not ready for production use.
-
-- Bounded footprint, LLM-free writes and verbatim recall are **structural** and
-  hold by construction.
-- The byte-efficiency advantage is **measured on one seed** and pending the
-  `binary-fifo` control. Do not quote a multiplier until that runs.
-- The reward loop is **a knob, not a demonstrated contribution.** Splitting works
-  on geometry alone; credit currently costs cold-fact retention.
-- Everything is a synthetic harness written by the author of the system under
-  test. LongMemEval / LoCoMo with an LLM judge is the roadmap item that turns any
-  of this into evidence.
+`mem.stats()` dump.
 
 ## License
 
